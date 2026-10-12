@@ -245,7 +245,8 @@ fn main() -> color_eyre::Result<()> {
         .map_or(usr_monitor_index, |i| *i);
 
     MONITOR_RIGHT.store(
-        state.monitors.elements()[monitor_index].size.right,
+        state.monitors.elements()[monitor_index].size.right
+            - state.monitors.elements()[monitor_index].size.left,
         Ordering::SeqCst,
     );
 
@@ -269,7 +270,9 @@ fn main() -> color_eyre::Result<()> {
                     y: state.monitors.elements()[monitor_index].size.top as f32,
                 }),
                 end: Some(Position {
-                    x: state.monitors.elements()[monitor_index].size.right as f32,
+                    x: (state.monitors.elements()[monitor_index].size.right
+                        - state.monitors.elements()[monitor_index].size.left)
+                        as f32,
                     y: 50.0,
                 }),
             })
@@ -284,7 +287,9 @@ fn main() -> color_eyre::Result<()> {
 
             if position.end.is_none() {
                 position.end = Some(Position {
-                    x: state.monitors.elements()[monitor_index].size.right as f32,
+                    x: (state.monitors.elements()[monitor_index].size.right
+                        - state.monitors.elements()[monitor_index].size.left)
+                        as f32,
                     y: 50.0,
                 })
             }

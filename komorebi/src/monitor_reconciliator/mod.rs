@@ -217,6 +217,99 @@ where
         .collect::<Vec<_>>())
 }
 
+fn update_monitor_from_attached(monitor: &mut Monitor, attached: &Monitor) -> bool {
+    let changed = monitor.id != attached.id
+        || monitor.name != attached.name
+        || monitor.device != attached.device
+        || monitor.device_id != attached.device_id
+        || monitor.serial_number_id != attached.serial_number_id
+        || monitor.size != attached.size
+        || monitor.work_area_size != attached.work_area_size;
+
+    if changed {
+        monitor.id = attached.id;
+        monitor.name = attached.name.clone();
+        monitor.device = attached.device.clone();
+        monitor.device_id = attached.device_id.clone();
+        monitor.serial_number_id = attached.serial_number_id.clone();
+        monitor.size = attached.size;
+        monitor.work_area_size = attached.work_area_size;
+    }
+
+    changed
+}
+
+fn update_monitors_from_attached(monitors: &mut [Monitor], attached_devices: &[Monitor]) -> bool {
+    let mut matched_attached = vec![false; attached_devices.len()];
+    let mut unmatched_monitors = Vec::new();
+    let mut changed = false;
+
+    for (monitor_index, monitor) in monitors.iter_mut().enumerate() {
+        let serial_match = monitor
+            .serial_number_id
+            .as_ref()
+            .filter(|serial| !serial.is_empty())
+            .and_then(|serial| {
+                let matches = attached_devices
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, attached)| {
+                        !matched_attached[*index]
+                            && attached
+                                .serial_number_id
+                                .as_ref()
+                                .is_some_and(|attached_serial| {
+                                    !attached_serial.is_empty() && attached_serial == serial
+                                })
+                    })
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                (matches.len() == 1).then_some(matches[0])
+            });
+
+        let device_match = serial_match.or_else(|| {
+            let matches = attached_devices
+                .iter()
+                .enumerate()
+                .filter(|(index, attached)| {
+                    !matched_attached[*index]
+                        && !monitor.device_id.is_empty()
+                        && monitor.device_id == attached.device_id
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            (matches.len() == 1).then_some(matches[0])
+        });
+
+        if let Some(attached_index) = device_match {
+            matched_attached[attached_index] = true;
+            changed |= update_monitor_from_attached(monitor, &attached_devices[attached_index]);
+        } else {
+            unmatched_monitors.push(monitor_index);
+        }
+    }
+
+    // A display can be replaced before Windows exposes a stable identity. Keep
+    // the logical monitor index and workspace state for equal-count changes.
+    if monitors.len() == attached_devices.len() {
+        let unmatched_attached = attached_devices
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| (!matched_attached[index]).then_some(index));
+
+        for (monitor_index, attached_index) in
+            unmatched_monitors.into_iter().zip(unmatched_attached)
+        {
+            changed |= update_monitor_from_attached(
+                &mut monitors[monitor_index],
+                &attached_devices[attached_index],
+            );
+        }
+    }
+
+    changed
+}
+
 pub fn listen_for_notifications(wm: Arc<Mutex<WindowManager>>) -> color_eyre::Result<()> {
     #[allow(clippy::expect_used)]
     Hidden::create("komorebi-hidden")?;
@@ -379,40 +472,38 @@ where
                 // Get the currently attached display devices
                 let attached_devices = attached_display_devices(display_provider)?;
 
-                // Make sure that in our state any attached displays have the latest Win32 data
-                for monitor in wm.monitors_mut() {
-                    for attached in &attached_devices {
-                        let serial_number_ids_match = if let (Some(attached_snid), Some(m_snid)) =
-                            (&attached.serial_number_id, &monitor.serial_number_id)
-                        {
-                            attached_snid.eq(m_snid)
-                        } else {
-                            false
-                        };
-
-                        if serial_number_ids_match || attached.device_id.eq(&monitor.device_id) {
-                            monitor.id = attached.id;
-                            monitor.device = attached.device.clone();
-                            monitor.device_id = attached.device_id.clone();
-                            monitor.serial_number_id = attached.serial_number_id.clone();
-                            monitor.name = attached.name.clone();
-                            monitor.size = attached.size;
-                            monitor.work_area_size = attached.work_area_size;
-                        }
-                    }
-                }
-
-                if initial_monitor_count == attached_devices.len() {
-                    tracing::debug!("monitor counts match, reconciliation not required");
-                    drop(wm);
-                    continue 'receiver;
-                }
+                // Update metadata without changing logical monitor order or workspace state.
+                let monitor_state_changed =
+                    update_monitors_from_attached(wm.monitors_mut(), &attached_devices);
 
                 if attached_devices.is_empty() {
                     tracing::debug!(
                         "no devices found, skipping reconciliation to avoid breaking state"
                     );
                     drop(wm);
+                    continue 'receiver;
+                }
+
+                if initial_monitor_count == attached_devices.len() {
+                    if monitor_state_changed {
+                        let offset = wm.work_area_offset;
+                        for monitor in wm.monitors_mut() {
+                            monitor.update_focused_workspace(offset)?;
+                        }
+                        wm.retile_all(true)?;
+                        wm.retile_all(true)?;
+                        border_manager::send_notification(None);
+
+                        notify_subscribers(
+                            Notification {
+                                event: NotificationEvent::Monitor(notification),
+                                state: wm.as_ref().into(),
+                            },
+                            initial_state.has_been_modified(&wm),
+                        )?;
+                    } else {
+                        tracing::debug!("monitor state unchanged, reconciliation not required");
+                    }
                     continue 'receiver;
                 }
 
@@ -458,31 +549,8 @@ where
                         // Re-acquire locks for state restoration
                         wm = wm_arc.lock();
 
-                        // Update Win32 data for all monitors
-                        for monitor in wm.monitors_mut() {
-                            for attached in &re_queried_devices {
-                                let serial_number_ids_match =
-                                    if let (Some(attached_snid), Some(m_snid)) =
-                                        (&attached.serial_number_id, &monitor.serial_number_id)
-                                    {
-                                        attached_snid.eq(m_snid)
-                                    } else {
-                                        false
-                                    };
-
-                                if serial_number_ids_match
-                                    || attached.device_id.eq(&monitor.device_id)
-                                {
-                                    monitor.id = attached.id;
-                                    monitor.device = attached.device.clone();
-                                    monitor.device_id = attached.device_id.clone();
-                                    monitor.serial_number_id = attached.serial_number_id.clone();
-                                    monitor.name = attached.name.clone();
-                                    monitor.size = attached.size;
-                                    monitor.work_area_size = attached.work_area_size;
-                                }
-                            }
-                        }
+                        // Update Win32 data for all monitors without changing logical order.
+                        update_monitors_from_attached(wm.monitors_mut(), &re_queried_devices);
 
                         // Try to restore windows that might have been minimized
                         let offset = wm.work_area_offset;
@@ -555,31 +623,9 @@ where
                         .get_or_init(|| Mutex::new(HashMap::new()))
                         .lock();
 
-                    // Make sure that in our state any attached displays have the latest Win32 data
-                    // We must do this again because we dropped the lock and are working with new data
-                    for monitor in wm.monitors_mut() {
-                        for attached in &re_queried_devices {
-                            let serial_number_ids_match =
-                                if let (Some(attached_snid), Some(m_snid)) =
-                                    (&attached.serial_number_id, &monitor.serial_number_id)
-                                {
-                                    attached_snid.eq(m_snid)
-                                } else {
-                                    false
-                                };
-
-                            if serial_number_ids_match || attached.device_id.eq(&monitor.device_id)
-                            {
-                                monitor.id = attached.id;
-                                monitor.device = attached.device.clone();
-                                monitor.device_id = attached.device_id.clone();
-                                monitor.serial_number_id = attached.serial_number_id.clone();
-                                monitor.name = attached.name.clone();
-                                monitor.size = attached.size;
-                                monitor.work_area_size = attached.work_area_size;
-                            }
-                        }
-                    }
+                    // Update Win32 data after re-acquiring the lock and using the
+                    // re-queried display list.
+                    update_monitors_from_attached(wm.monitors_mut(), &re_queried_devices);
 
                     // Use re-queried devices for remaining logic
                     re_queried_devices
@@ -962,7 +1008,7 @@ where
 
                 let final_count = wm.monitors().len();
 
-                if post_removal_monitor_count != final_count {
+                if initial_monitor_count != final_count {
                     wm.retile_all(true)?;
                     // Second retile to fix DPI/resolution related jank
                     wm.retile_all(true)?;
@@ -1282,5 +1328,84 @@ mod tests {
         } else {
             panic!("No monitors found");
         }
+    }
+
+    fn test_monitor(device_id: &str, serial_number_id: Option<&str>, right: i32) -> Monitor {
+        monitor::new(
+            right as isize,
+            Rect {
+                left: 0,
+                top: 0,
+                right,
+                bottom: 1080,
+            },
+            Rect {
+                left: 0,
+                top: 0,
+                right,
+                bottom: 1040,
+            },
+            device_id.to_string(),
+            device_id.to_string(),
+            device_id.to_string(),
+            serial_number_id.map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn monitor_metadata_follows_identity_when_enumeration_order_changes() {
+        let mut monitors = vec![
+            test_monitor("display-a", Some("serial-a"), 1920),
+            test_monitor("display-b", Some("serial-b"), 2560),
+        ];
+        let attached = vec![
+            test_monitor("display-b", Some("serial-b"), 3840),
+            test_monitor("display-a", Some("serial-a"), 1280),
+        ];
+
+        assert!(update_monitors_from_attached(&mut monitors, &attached));
+        assert_eq!(monitors[0].device_id, "display-a");
+        assert_eq!(monitors[0].size.right, 1280);
+        assert_eq!(monitors[1].device_id, "display-b");
+        assert_eq!(monitors[1].size.right, 3840);
+    }
+
+    #[test]
+    fn equal_count_replacement_keeps_logical_monitor_state() {
+        let mut monitors = vec![
+            test_monitor("display-a", Some("serial-a"), 1920),
+            test_monitor("display-b", Some("serial-b"), 2560),
+        ];
+        monitors[1]
+            .workspace_names
+            .insert(0, "preserved".to_string());
+        let attached = vec![
+            test_monitor("display-a", Some("serial-a"), 1920),
+            test_monitor("display-c", Some("serial-c"), 3840),
+        ];
+
+        assert!(update_monitors_from_attached(&mut monitors, &attached));
+        assert_eq!(monitors[1].device_id, "display-c");
+        assert_eq!(
+            monitors[1].workspace_names.get(&0).map(String::as_str),
+            Some("preserved")
+        );
+    }
+
+    #[test]
+    fn empty_enumeration_does_not_mutate_monitor_state() {
+        let mut monitors = vec![test_monitor("display-a", Some("serial-a"), 1920)];
+        let original = monitors[0].clone();
+
+        assert!(!update_monitors_from_attached(&mut monitors, &[]));
+        assert_eq!(monitors[0], original);
+    }
+
+    #[test]
+    fn unchanged_monitor_metadata_is_a_no_op() {
+        let mut monitors = vec![test_monitor("display-a", Some("serial-a"), 1920)];
+        let attached = vec![test_monitor("display-a", Some("serial-a"), 1920)];
+
+        assert!(!update_monitors_from_attached(&mut monitors, &attached));
     }
 }
