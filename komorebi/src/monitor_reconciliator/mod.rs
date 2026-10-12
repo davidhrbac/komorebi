@@ -239,6 +239,25 @@ fn update_monitor_from_attached(monitor: &mut Monitor, attached: &Monitor) -> bo
     changed
 }
 
+fn monitor_identity_matches(monitor: &Monitor, attached: &Monitor) -> bool {
+    let serial_matches = monitor
+        .serial_number_id
+        .as_ref()
+        .filter(|serial| !serial.is_empty())
+        .zip(
+            attached
+                .serial_number_id
+                .as_ref()
+                .filter(|serial| !serial.is_empty()),
+        )
+        .is_some_and(|(monitor_serial, attached_serial)| monitor_serial == attached_serial);
+
+    serial_matches
+        || (!monitor.device_id.is_empty()
+            && !attached.device_id.is_empty()
+            && monitor.device_id == attached.device_id)
+}
+
 fn update_monitors_from_attached(monitors: &mut [Monitor], attached_devices: &[Monitor]) -> bool {
     let mut matched_attached = vec![false; attached_devices.len()];
     let mut unmatched_monitors = Vec::new();
@@ -639,21 +658,16 @@ where
                     // Windows to remove from `known_hwnds`
                     let mut windows_to_remove = Vec::new();
 
-                    // Collect the ids in our state which aren't in the current attached display ids
-                    // These are monitors that have been removed
-                    let mut newly_removed_displays = vec![];
+                    // Collect logical monitor indices which aren't in the current attached
+                    // display list. Indices avoid treating empty identities as a shared key.
+                    let mut newly_removed_monitor_indices = vec![];
 
                     for (m_idx, m) in wm.monitors().iter().enumerate() {
-                        if !attached_devices.iter().any(|attached| {
-                            attached.serial_number_id.eq(&m.serial_number_id)
-                                || attached.device_id.eq(&m.device_id)
-                        }) {
-                            let id = m
-                                .serial_number_id
-                                .as_ref()
-                                .map_or(m.device_id.clone(), |sn| sn.clone());
-
-                            newly_removed_displays.push(id.clone());
+                        if !attached_devices
+                            .iter()
+                            .any(|attached| monitor_identity_matches(m, attached))
+                        {
+                            newly_removed_monitor_indices.push(m_idx);
 
                             let focused_workspace_idx = m.focused_workspace_idx();
 
@@ -725,13 +739,27 @@ where
                             // Let's add their state to the cache for later, make sure to use what
                             // the user set as preference as the id.
                             let dip = DISPLAY_INDEX_PREFERENCES.read();
-                            let mut dip_ids = dip.values();
-                            let preferred_id = if dip_ids.any(|id| id.eq(&m.device_id)) {
+                            let preferred_id = if !m.device_id.is_empty()
+                                && dip.values().any(|id| id.eq(&m.device_id))
+                            {
                                 m.device_id.clone()
-                            } else if dip_ids.any(|id| Some(id) == m.serial_number_id.as_ref()) {
-                                m.serial_number_id.clone().unwrap_or_default()
+                            } else if let Some(serial) = m
+                                .serial_number_id
+                                .as_ref()
+                                .filter(|serial| !serial.is_empty())
+                                && dip.values().any(|id| id == serial)
+                            {
+                                serial.clone()
+                            } else if !m.device_id.is_empty() {
+                                m.device_id.clone()
+                            } else if let Some(serial) = m
+                                .serial_number_id
+                                .as_ref()
+                                .filter(|serial| !serial.is_empty())
+                            {
+                                serial.clone()
                             } else {
-                                id
+                                format!("hmonitor:{}", m.id)
                             };
                             monitor_cache.insert(preferred_id, m.clone());
                         }
@@ -740,13 +768,14 @@ where
                     // Update known_hwnds
                     wm.known_hwnds.retain(|i, _| !windows_to_remove.contains(i));
 
-                    if !newly_removed_displays.is_empty() {
+                    if !newly_removed_monitor_indices.is_empty() {
                         // After we have cached them, remove them from our state
+                        let mut monitor_index = 0;
                         wm.monitors_mut().retain(|m| {
-                            !newly_removed_displays.iter().any(|id| {
-                                m.serial_number_id.as_ref().is_some_and(|sn| sn == id)
-                                    || m.device_id.eq(id)
-                            })
+                            let should_remove =
+                                newly_removed_monitor_indices.contains(&monitor_index);
+                            monitor_index += 1;
+                            !should_remove
                         });
                     }
 
@@ -1407,5 +1436,13 @@ mod tests {
         let attached = vec![test_monitor("display-a", Some("serial-a"), 1920)];
 
         assert!(!update_monitors_from_attached(&mut monitors, &attached));
+    }
+
+    #[test]
+    fn empty_monitor_identities_do_not_match() {
+        let monitor = test_monitor("", None, 1920);
+        let attached = test_monitor("", Some(""), 1920);
+
+        assert!(!monitor_identity_matches(&monitor, &attached));
     }
 }

@@ -1006,7 +1006,7 @@ impl eframe::App for Komobar {
                         top,
                         left,
                         bottom: monitor_size.bottom,
-                        right: left + right,
+                        right,
                     };
                     if monitor_size != rect {
                         tracing::info!(
